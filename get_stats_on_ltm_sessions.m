@@ -1,8 +1,12 @@
 function get_stats_on_ltm_sessions
 
+%% Params
+gap = 3600*24*3;
+
 data_folder = '../data/';
-filename = 'eegs_deid.xlsx';
+filename = 'deid_eegs.xlsx';
 results_folder = '../../results/';
+addpath(genpath('.'))
 
 if ~exist(results_folder,'dir')
     mkdir(results_folder)
@@ -25,69 +29,131 @@ T.hosp = new_hospital;
 %% Remove empty hospitals
 empty_hospital = cellfun(@isempty,new_hospital);
 T(empty_hospital,:) = [];
+
+%% fake ids
+fake_id = cellfun(@(x) str2double(x),T.fake_id);
+% remove empty fake ids
+T(fake_id==0,:) = [];
+fake_id = cellfun(@(x) str2double(x),T.fake_id);
+
 hospital = T.hosp;
 n_eegs = size(T,1);
 
 %% convert dates to datetime
-date_str = T.start;
-date_time = cellfun(@datetime,date_str);
+% seconds since Jan 1 1970
+start_date = cellfun(@(x) str2double(x),T.start); 
+end_date = cellfun(@(x) str2double(x),T.xEnd);
 
 %% duration
 duration = cellfun(@(x) str2double(x),T.duration);
+alt_duration = end_date-start_date; % figure out why some alt_durations are zero...
+assert(isequal(duration(~isnan(duration)),alt_duration(~isnan(duration))))
 
-%% fake ids
-fake_id = cellfun(@(x) str2double(x),T.fake_id);
+[session_id,pt] = build_sessions(fake_id,start_date,end_date,gap,T);
 
-
-%% Get sessions
-session_id = str2double(T.session_id);
-unique_sessions = unique(session_id);
-nsessions = length(unique(session_id));
-
-%% Get stats on sessions
-neegs_per_session = nan(nsessions,1);
-duration_per_session = nan(nsessions,1);
-eegs_per_session = cell(nsessions,1);
-for i = 1:nsessions
-    curr_session = unique_sessions(i);
+%% Make a table of all sessions
+%{
+session_tab = [];
+for ip = 1:length(pt)
+    for is = 1:length(pt(ip).session)
+        neegs = length(pt(ip).session(is).eegs);
+        
+        
+        session_tab = [session_tab;...
+            repmat(pt(ip).id,neegs,1),...
+            repmat(pt(ip).session(is).id,neegs,1)...
+            pt(ip).session(is).eegs,...
+            pt(ip).session(is).times,...
+            pt(ip).session(is).durations,...
+            repmat(pt(ip).session(is).full_duration,neegs,1)...
+            repmat(pt(ip).session(is).is_ltm,neegs,1),...
+            repmat(pt(ip).session(is).routine_start,neegs,1)];
+    end
     
-    % get eegs matching
-    curr_eegs = session_id == curr_session;
-    eegs_per_session{i} = find(curr_eegs);
-    
-    neegs_per_session(i) = sum(curr_eegs);
-    
-    % confirm that patient ids all the same
-    assert(length(unique(fake_id(curr_eegs)))==1)
-    
-    % Get the associated durations
-    curr_durations = duration(curr_eegs);
-    
-    % sum up the full duration
-    duration_per_session(i) = sum(curr_durations);
 end
 
-% look for funny sessions
-[~,longest_session] = max(duration_per_session);
+sT = array2table(session_tab,'VariableNames',{'Patient','Session',...
+    'EEG','Start','End','Duration','SessionDuration','LTM','RoutineStart'});
 
-% find ltms
-is_ltm = duration_per_session > 60*12;
-fprintf('\nOf the %d session, %d are longer than 12 hours.\n',...
-    nsessions,sum(is_ltm));
+%% Sanity checks
+empty_time = isnan(sT.Start) | isnan(sT.End);
+assert(isequal(sT.End(~empty_time)-sT.Start(~empty_time),sT.Duration(~empty_time)))
+%}
+
+%% Make a table of LTM session info
+session_tab = [];
+for ip = 1:length(pt)
+    for is = 1:length(pt(ip).session)
+        neegs = length(pt(ip).session(is).eegs);
+        session_tab = [session_tab;...
+            pt(ip).id,...
+            pt(ip).session(is).id,...
+            neegs,...
+            pt(ip).session(is).full_duration,...
+            pt(ip).session(is).is_ltm,...
+            pt(ip).session(is).routine_start,...
+            pt(ip).session(is).start_duration,...
+            pt(ip).session(is).any_sz,...
+            pt(ip).session(is).first_sz,...
+            pt(ip).session(is).first_spike];
+        
+    end
+end
+sT = array2table(session_tab,'VariableNames',{'Patient','Session',...
+    'NumberEEGs','Duration','LTM','RoutineStart','StartDuration',...
+    'AnySz','FirstSz','FirstSpike'});
+
+%% Sanity checks
+% sz stuff
+no_sz = isnan(sT.FirstSz);
+assert(~any(sT.AnySz(no_sz)==1));
+
+%% Remove those with empty duration
+empty_duration = isnan(sT.Duration);
+sT(empty_duration,:) = [];
+
+%% Restrict to LTM
+ltm = sT.LTM;
+sT(~ltm,:) = [];
+assert(~any(sT.Duration<3600*12))
+
+%% How many start with routines?
+fprintf(['\n%d of %d LTM sessions start with routines.\n'],sum(sT.RoutineStart==1),...
+    length(sT.RoutineStart));
+
+%% Start duration
 figure
-nexttile
-histogram(duration_per_session(is_ltm)/60/24)
-xlabel('Days')
-ylabel('Number of LTM sessions')
-title('Total duration of LTM sessions')
+histogram(sT.StartDuration/3600)
+xlabel('Duration of first EEG (hours)')
+ylabel('Number of sessions')
 set(gca,'fontsize',15)
 
-nexttile
-histogram(neegs_per_session(is_ltm))
-xlabel('Number of EEGs per LTM session')
-ylabel('Number of LTM sessions')
-title('Number of EEGs per LTM session')
-set(gca,'fontsize',15)
+%% How many have seizures
+fprintf(['\n%d of %d (%1.1f%%) of LTM sessions have seizures. '...
+    'Of those with seizures, %d (%1.1f%%) occur in first report. \n'],sum(sT.AnySz==1),...
+    length(sT.AnySz),sum(sT.AnySz==1)/length(sT.AnySz)*100,...
+    sum(sT.FirstSz==1),sum(sT.FirstSz==1)/sum(sT.AnySz==1)*100);
+
+%% Main spikey question
+% Of patients who start with a routine, odds of sz if no spikes and no sz
+% on routine?
+nT = sT;
+nT(sT.RoutineStart==0,:) = [];
+pred = zeros(size(nT,1),1);
+pred(nT.FirstSz==1 | nT.FirstSpike == 1) = 1;
+pred = logical(pred);
+predicted = cell(size(nT,1),1);
+predicted(pred) = {'sz'};
+predicted(~pred) = {'no_sz'};
+actual = cell(size(nT,1),1);
+actual(nT.AnySz == 1) = {'sz'};
+actual(nT.AnySz ~= 1) = {'no_sz'};
+out = jay_confusion_matrix(predicted,actual,1);
+
+spike_mat = [sum(nT.AnySz == 1 & (nT.FirstSz==1 | nT.FirstSpike == 1)),... % yes sz and either spikes or sz on first eeg
+    sum(nT.AnySz == 1 & ((nT.FirstSz>1 | isnan(nT.FirstSz)) & (nT.FirstSpike>1 | isnan(nT.FirstSpike))));... % yes sz and no spikes and no sz on first eeg
+    sum(nT.AnySz == 0 & (nT.FirstSz==1 | nT.FirstSpike == 1)),... % no sz...
+    sum(nT.AnySz == 0 & ((nT.FirstSz>1 | isnan(nT.FirstSz)) & (nT.FirstSpike>1 | isnan(nT.FirstSpike))))]; % no sz,...
 
 end
 
